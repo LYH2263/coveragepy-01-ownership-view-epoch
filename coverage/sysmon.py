@@ -185,6 +185,11 @@ class CodeInfo:
     # sequential fall-through arcs that aren't the result of a branch.
     last_line: TLineNo | None = None
 
+    # The view-finding epoch this code object was framed under.  A code object
+    # re-entering after sys.path changed carries a stale epoch and is re-judged
+    # even though its id is still in code_infos.
+    epoch: int = -1
+
 
 class SysMonitor(Tracer):
     """Python implementation of the raw data tracer for PEP669 implementations."""
@@ -205,6 +210,11 @@ class SysMonitor(Tracer):
         self.unlock_data: Callable[[], None]
         # TODO: warn is unused.
         self.warn: TWarnFn
+
+        # View-finding epoch wiring, set from the collector.  When None this
+        # tracer keeps its code-object cache without epoch re-judgment.
+        self.view_epoch: Any = None
+        self.frame_memory: Any = None
 
         assert sys_monitoring is not None
         # sys.monitoring pre-allocates tool ids, but it's kind of pointless.
@@ -329,16 +339,25 @@ class SysMonitor(Tracer):
             return DISABLE
 
         # Entering a new frame.  Decide if we should trace in this file.
+        if self.view_epoch is not None:
+            # Cheap sys.path generation check: a stale code_info (or a stale
+            # memory entry) must be re-judged under the new epoch.
+            epoch = self.view_epoch.punch()
+        else:
+            epoch = -1
         code_info = self.code_infos.get(id(code))
         tracing_code: bool | None = None
         file_data: TTraceFileData | None = None
-        if code_info is not None:
+        if code_info is not None and code_info.epoch == epoch:
             tracing_code = code_info.tracing
             file_data = code_info.file_data
 
         if tracing_code is None:
             filename = code.co_filename
-            disp = self.should_trace_cache.get(filename)
+            if self.frame_memory is not None:
+                disp = self.frame_memory.get(filename, epoch)
+            else:
+                disp = self.should_trace_cache.get(filename)
             if disp is None:
                 frame = inspect.currentframe()
                 if frame is not None:
@@ -347,7 +366,10 @@ class SysMonitor(Tracer):
                         # @panopticon adds a frame.
                         frame = frame.f_back  # type: ignore[union-attr]
                 disp = self.should_trace(filename, frame)  # type: ignore[arg-type]
-                self.should_trace_cache[filename] = disp
+                if self.frame_memory is not None:
+                    self.frame_memory.put(filename, epoch, disp)
+                else:
+                    self.should_trace_cache[filename] = disp
 
             tracing_code = disp.trace
             if tracing_code:
@@ -371,6 +393,7 @@ class SysMonitor(Tracer):
                 file_data=file_data,
                 byte_to_line=b2l,
                 branch_resolver=None,
+                epoch=epoch,
             )
             self.code_infos[id(code)] = code_info
             self.code_objects.append(code)

@@ -219,6 +219,11 @@ class CoverageConfig(TConfigurable, TPluginConfig):
         self.source_pkgs: list[str] = []
         self.source_dirs: list[str] = []
         self.timid = False
+        # View-finding epoch isolation: when enabled, epoch advancement after a
+        # sys.path change never destroys already-observed ownership decisions,
+        # and nested collectors can't write through this collector's observed
+        # states.  Off by default; see coverage/framing.py.
+        self.view_isolation = False
         self._crash: str | None = None
 
         # Defaults for [report]

@@ -25,10 +25,52 @@ os = isolate_module(os)
 RELATIVE_DIR: str = ""
 CANONICAL_FILENAME_CACHE: dict[str, str] = {}
 
+# Canonical file names that were resolved from a relative file name.  Their
+# resolution depends on sys.path, so they can only be trusted while the
+# import-path generation (see below) hasn't advanced.
+_CANONICAL_RELATIVE_KEYS: set[str] = set()
+
+# The import-path generation that each relative-key cache entry was resolved
+# under.  Entries stamped with an older generation must be re-resolved rather
+# than trusted.
+_CANONICAL_KEY_GENERATION: dict[str, int] = {}
+
+# The current process-wide import-path generation.  It advances whenever a
+# view-finding epoch notices that sys.path has changed.  Absolute file names
+# don't depend on sys.path and are never invalidated by it.
+_CANONICAL_GENERATION: int = 0
+
+
+def canonical_generation() -> int:
+    """Return the current import-path generation used for canonical naming."""
+    return _CANONICAL_GENERATION
+
+
+def advance_canonical_generation() -> int:
+    """Advance the import-path generation.
+
+    Relative file names are resolved through sys.path, so when sys.path
+    changes their cached resolutions become stale.  Drop them so the next
+    `canonical_filename` call re-resolves them under the new paths.
+
+    Absolute entries are kept: they don't depend on sys.path, and keeping them
+    preserves the one-resolution-per-file behavior when framing rules don't
+    change.  Already collected line data is never touched here.
+
+    """
+    global _CANONICAL_GENERATION
+    _CANONICAL_GENERATION += 1
+    for key in _CANONICAL_RELATIVE_KEYS:
+        CANONICAL_FILENAME_CACHE.pop(key, None)
+        _CANONICAL_KEY_GENERATION.pop(key, None)
+    _CANONICAL_RELATIVE_KEYS.clear()
+    return _CANONICAL_GENERATION
+
 
 def set_relative_directory() -> None:
     """Set the directory that `relative_filename` will be relative to."""
     global RELATIVE_DIR, CANONICAL_FILENAME_CACHE
+    global _CANONICAL_RELATIVE_KEYS, _CANONICAL_KEY_GENERATION, _CANONICAL_GENERATION
 
     # The current directory
     abs_curdir = abs_file(os.curdir)
@@ -42,6 +84,9 @@ def set_relative_directory() -> None:
     # Cache of results of calling the canonical_filename() method, to
     # avoid duplicating work.
     CANONICAL_FILENAME_CACHE = {}
+    _CANONICAL_RELATIVE_KEYS = set()
+    _CANONICAL_KEY_GENERATION = {}
+    _CANONICAL_GENERATION = 0
 
 
 def relative_directory() -> str:
@@ -67,24 +112,41 @@ def canonical_filename(filename: str) -> str:
 
     An absolute path with no redundant components and normalized case.
 
+    Relative file names are resolved through sys.path, so their cached
+    resolution is only reused while it carries the current import-path
+    generation.  A stale entry is re-resolved instead of trusted, which keeps
+    a nested collector's sys.path change from writing through an outer
+    collector's already-observed file names.
+
     """
-    if filename not in CANONICAL_FILENAME_CACHE:
-        cf = filename
-        if not os.path.isabs(filename):
-            for path in [os.curdir] + sys.path:
-                if path is None:
-                    continue  # type: ignore[unreachable]
-                f = os.path.join(path, filename)
-                try:
-                    exists = os.path.exists(f)
-                except UnicodeError:
-                    exists = False
-                if exists:
-                    cf = f
-                    break
-        cf = abs_file(cf)
-        CANONICAL_FILENAME_CACHE[filename] = cf
-    return CANONICAL_FILENAME_CACHE[filename]
+    is_relative = not os.path.isabs(filename)
+    if filename in CANONICAL_FILENAME_CACHE:
+        if (
+            not is_relative
+            or _CANONICAL_KEY_GENERATION.get(filename) == _CANONICAL_GENERATION
+        ):
+            return CANONICAL_FILENAME_CACHE[filename]
+        # A relative name resolved under an older sys.path generation:
+        # fall through and re-resolve it under the current paths.
+    cf = filename
+    if is_relative:
+        for path in [os.curdir] + sys.path:
+            if path is None:
+                continue  # type: ignore[unreachable]
+            f = os.path.join(path, filename)
+            try:
+                exists = os.path.exists(f)
+            except UnicodeError:
+                exists = False
+            if exists:
+                cf = f
+                break
+    cf = abs_file(cf)
+    CANONICAL_FILENAME_CACHE[filename] = cf
+    if is_relative:
+        _CANONICAL_RELATIVE_KEYS.add(filename)
+        _CANONICAL_KEY_GENERATION[filename] = _CANONICAL_GENERATION
+    return cf
 
 
 def flat_rootname(filename: str) -> str:

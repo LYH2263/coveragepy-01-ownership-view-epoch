@@ -18,6 +18,7 @@ from coverage.core import Core
 from coverage.data import CoverageData
 from coverage.debug import short_stack
 from coverage.exceptions import ConfigError
+from coverage.framing import FramingMemory, ViewEpoch
 from coverage.misc import human_sorted_items, isolate_module
 from coverage.plugin import CoveragePlugin
 from coverage.types import (
@@ -69,6 +70,7 @@ class Collector:
         branch: bool,
         warn: TWarnFn,
         concurrency: list[str],
+        view_isolation: bool = False,
     ) -> None:
         """Create a collector.
 
@@ -100,6 +102,13 @@ class Collector:
         (the default).  "thread" can be combined with one of the other three.
         Other values are ignored.
 
+        `view_isolation` enables view-finding epoch isolation: epoch
+        advancement then never destroys already-observed ownership decisions,
+        and nested collectors can't write through this collector's observed
+        states.  It defaults to off, preserving the historical behavior; the
+        hot-path epoch re-judgment, single-decision stability and nested
+        resume re-framing guarantees apply either way.
+
         """
         self.core = core
         self.should_trace = should_trace
@@ -111,6 +120,17 @@ class Collector:
         assert isinstance(concurrency, list), f"Expected a list: {concurrency!r}"
 
         self.pid = os.getpid()
+
+        # View-finding epoch and the epoch-scoped ownership memory.  They are
+        # created once so InOrOut and every tracer keep stable references across
+        # reset()/load()/erase() cycles.  Advancing the epoch unbinds (or, in
+        # isolated mode, merely unbinds while retaining) memory decisions; it
+        # never touches the collected line data below.
+        self.view_isolation = view_isolation
+        self.view_epoch = ViewEpoch(isolated=view_isolation)
+        self.frame_memory = FramingMemory(isolated=view_isolation)
+        self.view_epoch.add_on_advance(lambda epoch: self.frame_memory.invalidate())
+        self.settled_epoch = 0
 
         self.covdata: CoverageData
         self.threading = None
@@ -199,14 +219,21 @@ class Collector:
 
         self.disabled_plugins: set[str] = set()
 
-        # The .should_trace_cache attribute is a cache from file names to
-        # coverage.FileDisposition objects, or None.  When a file is first
-        # considered for tracing, a FileDisposition is obtained from
-        # Coverage.should_trace.  Its .trace attribute indicates whether the
-        # file should be traced or not.  If it should be, a plugin with dynamic
-        # file names can decide not to trace it based on the dynamic file name
-        # being excluded by the inclusion rules, in which case the
-        # FileDisposition will be replaced by None in the cache.
+        # The .should_trace_cache attribute is the raw mapping behind
+        # self.frame_memory: file names to coverage.FileDisposition objects,
+        # or None.  When a file is first considered for tracing, a
+        # FileDisposition is obtained from Coverage.should_trace.  Its .trace
+        # attribute indicates whether the file should be traced or not.  If
+        # it should be, a plugin with dynamic file names can decide not to
+        # trace it based on the dynamic file name being excluded by the
+        # inclusion rules, in which case the FileDisposition will be replaced
+        # by None in the cache.
+        #
+        # The FramingMemory wrapper makes this mapping speak view-finding
+        # epochs: entries are only trusted for the epoch at which they were
+        # decided.  reset() unbinds the decisions, but doesn't destroy the
+        # underlying mapping object, so tracers and the C tracer keep valid
+        # references.
         if env.PYPY:
             import __pypy__  # pylint: disable=import-error
 
@@ -224,9 +251,11 @@ class Collector:
             #
             # This gives a 20% benefit on the workload described at
             # https://bitbucket.org/pypy/pypy/issue/1871/10x-slower-than-cpython-under-coverage
-            self.should_trace_cache = __pypy__.newdict("module")
+            raw_cache = __pypy__.newdict("module")
         else:
-            self.should_trace_cache = {}
+            raw_cache = {}
+        self.frame_memory.reset(raw_cache)
+        self.should_trace_cache = self.frame_memory.raw
 
         # Our active Tracers.
         self.tracers: list[Tracer] = []
@@ -253,6 +282,15 @@ class Collector:
         tracer.should_trace = self.should_trace
         tracer.should_trace_cache = self.should_trace_cache
         tracer.warn = self.warn
+
+        # Epoch-aware Python tracers share the collector's view-finding epoch
+        # and framing memory so the hot path and stack framing re-judge on path
+        # generations.  The C tracer only speaks the raw cache dict, so it
+        # simply inherits the (invalidated-in-place) should_trace_cache.
+        if hasattr(tracer, "view_epoch"):
+            tracer.view_epoch = self.view_epoch
+        if hasattr(tracer, "frame_memory"):
+            tracer.frame_memory = self.frame_memory
 
         if hasattr(tracer, "concur_id_func"):
             tracer.concur_id_func = self.concur_id_func
@@ -363,6 +401,13 @@ class Collector:
 
     def resume(self) -> None:
         """Resume tracing after a `pause`."""
+        # A nested collector may have rewritten sys.path while we were paused.
+        # Punch the view-finding epoch before any frame is traced again: this
+        # recomputes the sys.path-dependent matchers, invalidates epoch-scoped
+        # memory and relative canonical names, and leaves every tracer's
+        # framed epoch stale so its next call event re-frames under the new
+        # generation instead of reusing the pre-nesting decision.
+        self.view_epoch.punch()
         for tracer in self.tracers:
             tracer.start()
         if self.core.systrace:
@@ -370,6 +415,20 @@ class Collector:
                 self.threading.settrace(self._installation_trace)
             else:
                 self._start_tracer()
+
+    def settle_views(self) -> int:
+        """Settle view-finding state before flushing measured data.
+
+        Ensures any last sys.path change is observed as an epoch advancement
+        before the measured file set is finalized, and returns the epoch the
+        settlement was made at.  Collected line data is never removed; the
+        measured files after settlement therefore match the execution that the
+        re-judged framing decisions actually allowed.
+
+        """
+        epoch = self.view_epoch.punch()
+        self.settled_epoch = epoch
+        return epoch
 
     def post_fork(self) -> None:
         """After a fork, tracers might need to adjust."""

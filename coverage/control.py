@@ -159,6 +159,7 @@ class Coverage(TConfigurable):
         context: str | None = None,
         messages: bool = False,
         plugins: Iterable[Callable[..., None]] | None = None,
+        view_isolation: bool = False,
     ) -> None:
         """
         Many of these arguments duplicate and override values that can be
@@ -261,6 +262,16 @@ class Coverage(TConfigurable):
 
         .. version-added:: 7.8
             The `source_dirs` parameter.
+
+        If `view_isolation` is true, view-finding epoch isolation is enabled:
+        after a mid-session sys.path change, already-observed ownership
+        decisions and measured data can't be written through by nested
+        collectors or memory invalidation; only newly framed observations take
+        effect at the new path generation.  It forces the Python tracer.  The
+        COVERAGE_VIEW_ISOLATION environment variable can also enable it.
+
+        .. version-added:: 7.9
+            The `view_isolation` parameter.
         """
         # Start self.config as a usable default configuration. It will soon be
         # replaced with the real configuration.
@@ -340,6 +351,13 @@ class Coverage(TConfigurable):
                 concurrency=concurrency,
                 context=context,
             )
+
+        # View-finding epoch isolation is an opt-in, optional constructor
+        # parameter (no new required parameters) and can also be switched on
+        # with an environment variable.  Apply it after config loading so it
+        # can't be silently overridden by a config file.
+        if view_isolation or os.getenv("COVERAGE_VIEW_ISOLATION", "") == "1":
+            self.config.view_isolation = True
 
         # If we have subprocess measurement happening automatically, then we
         # want any explicit creation of a Coverage object to mean, this process
@@ -604,6 +622,7 @@ class Coverage(TConfigurable):
             branch=self.config.branch,
             warn=self._warn,
             concurrency=concurrency,
+            view_isolation=self.config.view_isolation,
         )
 
         suffix = self._data_suffix_specified
@@ -646,6 +665,16 @@ class Coverage(TConfigurable):
         )
         self._inorout.plugins = self._plugins
         self._inorout.disp_class = self._core.file_disposition_class
+
+        # Bind the ownership plane to the collector's view-finding epoch.
+        # When sys.path changes, the epoch advances first; its callbacks then
+        # recompute the sys.path-dependent matchers here, invalidate the
+        # epoch-scoped framing memory and the relative canonical-name cache,
+        # and leave tracer stack framing stale for re-judgment.
+        self._inorout.view_epoch = self._collector.view_epoch
+        self._collector.view_epoch.add_on_advance(
+            self._inorout._syspath_generation_advanced
+        )
 
         # It's useful to write debug info after initing for start.
         self._should_write_debug = True
@@ -940,6 +969,13 @@ class Coverage(TConfigurable):
             for plugin in self._plugins:
                 if not plugin._coverage_enabled:
                     self._collector.plugin_was_disabled(plugin)
+
+            # Settle the view-finding epoch before flushing: any last sys.path
+            # change is observed now, and the measured file set is finalized at
+            # that generation.  Epoch invalidation never removes already
+            # collected lines, so measured_files() still matches the execution
+            # the re-judged framing actually allowed.
+            self._collector.settle_views()
 
             if self._collector.flush_data():
                 self._post_save_work()

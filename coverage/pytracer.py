@@ -92,6 +92,15 @@ class PyTracer(Tracer):
         self.unlock_data: Callable[[], None]
         self.warn: TWarnFn
 
+        # View-finding epoch wiring, set from the collector.  When None (for
+        # direct unit-test construction) the tracer falls back to the plain
+        # should_trace_cache behavior.
+        self.view_epoch: Any = None
+        self.frame_memory: Any = None
+        # The epoch our current cur_file_data/cur_file_name framing was bound
+        # to.  A mismatch means even a same-filename re-entry must re-judge.
+        self.framed_epoch = -1
+
         # The threading module to use, if any.
         self.threading: ModuleType | None = None
 
@@ -102,14 +111,18 @@ class PyTracer(Tracer):
         self.started_context = False
 
         # The data_stack parallels the Python call stack. Each entry is
-        # information about an active frame, a four-element tuple:
+        # information about an active frame, a five-element tuple:
         #   [0] The TTraceData for this frame's file. Could be None if we
         #           aren't tracing this frame.
         #   [1] The current file name for the frame. None if we aren't tracing
         #           this frame.
         #   [2] The last line number executed in this frame.
         #   [3] Boolean: did this frame start a new context?
-        self.data_stack: list[tuple[TTraceFileData | None, str | None, TLineNo, bool]] = []
+        #   [4] The view-finding epoch this frame was framed under, so a
+        #           restored caller frame can re-judge after path generations.
+        self.data_stack: list[
+            tuple[TTraceFileData | None, str | None, TLineNo, bool, int]
+        ] = []
         self.thread: threading.Thread | None = None
         self.stopped = False
         self._activity = False
@@ -139,10 +152,67 @@ class PyTracer(Tracer):
             if 0:  # if you want callers..
                 f.write(" | ")  # type: ignore[unreachable]
                 stack = " / ".join(
-                    (fname or "???").rpartition("/")[-1] for _, fname, _, _ in self.data_stack
+                    (fname or "???").rpartition("/")[-1]
+                    for _, fname, _, _, _ in self.data_stack
                 )
                 f.write(stack)
             f.write("\n")
+
+    def _frame_file(
+        self,
+        filename: str,
+        frame: FrameType,
+        epoch: int,
+    ) -> None:
+        """Bind the framing for `filename` to view-finding epoch `epoch`.
+
+        Looks up the epoch-scoped ownership memory, re-running the ownership
+        decision on a miss (which itself re-checks sys.path and may advance the
+        epoch), then attaches the right data bucket to ``cur_file_data`` or
+        disables line tracing for an excluded file.
+
+        """
+        self.cur_file_name = filename
+        if self.frame_memory is not None:
+            disp = self.frame_memory.get(filename, epoch)
+            if disp is None:
+                disp = self.should_trace(filename, frame)
+                self.frame_memory.put(filename, epoch, disp)
+            self.framed_epoch = epoch
+        else:
+            # Legacy path: no epoch wiring, speak the raw cache dict directly.
+            disp = self.should_trace_cache.get(filename)
+            if disp is None:
+                disp = self.should_trace(filename, frame)
+                self.should_trace_cache[filename] = disp
+
+        self.cur_file_data = None
+        if disp.trace:
+            tracename = disp.source_filename
+            assert tracename is not None
+            self.lock_data()
+            try:
+                if tracename not in self.data:
+                    self.data[tracename] = set()
+            finally:
+                self.unlock_data()
+            self.cur_file_data = self.data[tracename]
+        else:
+            frame.f_trace_lines = False
+
+    def _reframe_live_frame(self, frame: FrameType) -> None:
+        """Re-judge the frame currently on top after an epoch advancement.
+
+        Used from line/return events when sys.path changed while the frame was
+        already live: the next recorded line or arc must follow the new
+        ownership decision even though no new call event happened.  Already
+        recorded lines stay in their buckets; invalidation never removes them.
+
+        """
+        assert self.view_epoch is not None
+        epoch = self.view_epoch.punch()
+        if epoch != self.framed_epoch:
+            self._frame_file(frame.f_code.co_filename, frame, epoch)
 
     def _trace(
         self,
@@ -170,9 +240,13 @@ class PyTracer(Tracer):
                     f = f.f_back
             sys.settrace(None)
             try:
-                self.cur_file_data, self.cur_file_name, self.last_line, self.started_context = (
-                    self.data_stack.pop()
-                )
+                (
+                    self.cur_file_data,
+                    self.cur_file_name,
+                    self.last_line,
+                    self.started_context,
+                    self.framed_epoch,
+                ) = self.data_stack.pop()
             except IndexError:
                 self.log(
                     "Empty stack!",
@@ -202,12 +276,31 @@ class PyTracer(Tracer):
 
             # Entering a new frame.  Decide if we should trace in this file.
             self._activity = True
+            if self.view_epoch is not None:
+                # The hot-path epoch check: even when the same co_filename
+                # re-enters and no new context started, an advanced epoch must
+                # force re-framing.  When nothing changed, punch() is just a
+                # list comparison and the one-decision-per-file-per-epoch
+                # property is preserved.
+                epoch = self.view_epoch.punch()
+                needs_framing = (
+                    frame.f_code.co_filename != self.cur_file_name
+                    or started_context
+                    or epoch != self.framed_epoch
+                )
+            else:
+                epoch = -1
+                needs_framing = (
+                    frame.f_code.co_filename != self.cur_file_name or started_context
+                )
+
             self.data_stack.append(
                 (
                     self.cur_file_data,
                     self.cur_file_name,
                     self.last_line,
                     started_context,
+                    self.framed_epoch,
                 ),
             )
 
@@ -216,28 +309,9 @@ class PyTracer(Tracer):
             # don't have to re-check whether to trace the corresponding
             # function (which is a little bit expensive since it involves
             # dictionary lookups). This optimization is only correct if we
-            # didn't start a context.
-            filename = frame.f_code.co_filename
-            if filename != self.cur_file_name or started_context:
-                self.cur_file_name = filename
-                disp = self.should_trace_cache.get(filename)
-                if disp is None:
-                    disp = self.should_trace(filename, frame)
-                    self.should_trace_cache[filename] = disp
-
-                self.cur_file_data = None
-                if disp.trace:
-                    tracename = disp.source_filename
-                    assert tracename is not None
-                    self.lock_data()
-                    try:
-                        if tracename not in self.data:
-                            self.data[tracename] = set()
-                    finally:
-                        self.unlock_data()
-                    self.cur_file_data = self.data[tracename]
-                else:
-                    frame.f_trace_lines = False
+            # didn't start a context, and the view-finding epoch hasn't moved.
+            if needs_framing:
+                self._frame_file(frame.f_code.co_filename, frame, epoch)
             elif not self.cur_file_data:
                 frame.f_trace_lines = False
 
@@ -259,6 +333,13 @@ class PyTracer(Tracer):
 
         elif event == "line":
             # Record an executed line.
+            if (
+                self.view_epoch is not None
+                and self.framed_epoch != self.view_epoch.epoch
+            ):
+                # sys.path changed while this frame was on the stack: re-judge
+                # before recording so new lines follow the new ownership rule.
+                self._reframe_live_frame(frame)
             if self.cur_file_data is not None:
                 if PUSH_EXC_INFO is not None:
                     lasti = frame.f_lasti
@@ -278,6 +359,14 @@ class PyTracer(Tracer):
                 self.last_line = flineno
 
         elif event == "return":
+            if (
+                self.view_epoch is not None
+                and self.framed_epoch != self.view_epoch.epoch
+            ):
+                # The epoch moved while this frame was live (for example the
+                # frame itself rewrote sys.path): re-judge before the final
+                # arc is recorded.
+                self._reframe_live_frame(frame)
             if self.trace_arcs and self.cur_file_data:
                 # Record an arc leaving the function, but beware that a
                 # "return" event might just mean yielding from a generator.
@@ -312,14 +401,32 @@ class PyTracer(Tracer):
                     cast(set_TArc, self.cur_file_data).add((self.last_line, -first))
 
             # Leaving this function, pop the filename stack.
-            self.cur_file_data, self.cur_file_name, self.last_line, self.started_context = (
-                self.data_stack.pop()
-            )
+            (
+                self.cur_file_data,
+                self.cur_file_name,
+                self.last_line,
+                self.started_context,
+                restored_epoch,
+            ) = self.data_stack.pop()
+            self.framed_epoch = restored_epoch
             # Leaving a context?
             if self.started_context:
                 assert self.switch_context is not None
                 self.context = None
                 self.switch_context(None)  # pylint: disable=not-callable
+            # The restored caller frame was framed under an older generation:
+            # re-frame it under the current epoch so its subsequent events
+            # follow the new rules instead of the pre-change cur_file_data.
+            if (
+                self.view_epoch is not None
+                and self.cur_file_name is not None
+                and restored_epoch != self.view_epoch.epoch
+            ):
+                self._frame_file(
+                    self.cur_file_name,
+                    frame.f_back,
+                    self.view_epoch.punch(),
+                )
 
         return self._cached_bound_method_trace
 

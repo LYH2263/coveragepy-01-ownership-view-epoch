@@ -84,6 +84,12 @@ class Core:
         if config.timid:
             core_name = "pytrace"
             _debug("core.py: Using pytrace because timid=True")
+        elif getattr(config, "view_isolation", False):
+            # Epoch isolation is implemented in the Python tracer planes
+            # (framing memory, hot path, stack framing); force it so the
+            # isolation contract can't be silently weakened by another core.
+            core_name = "pytrace"
+            _debug("core.py: Using pytrace because view_isolation=True")
         elif core_name is None:
             # This could still leave core_name as None.
             core_name = config.core

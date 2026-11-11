@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 from coverage import env
 from coverage.disposition import FileDisposition, disposition_init
 from coverage.exceptions import ConfigError, CoverageException, PluginError
+from coverage.framing import ViewEpoch
 from coverage.files import (
     GlobMatcher,
     ModuleMatcher,
@@ -287,6 +288,11 @@ class InOrOut:
             self.cover_paths, "coverage", "Coverage code", self._debug
         )
 
+        # When a collector is driving us, its view-finding epoch owns sys.path
+        # change detection; _syspath_generation_advanced recomputes the
+        # sys.path-dependent matchers as part of the epoch advancement.
+        self.view_epoch: ViewEpoch | None = None
+
         self.last_sys_path = list(sys.path)
         self.set_matchers_depending_on_syspath()
 
@@ -342,6 +348,19 @@ class InOrOut:
             self.source_in_third_paths, "source_in_third", "Source in third-party", self._debug
         )
 
+    def _syspath_generation_advanced(self, epoch: int) -> None:
+        """React to a view-finding epoch advancing because sys.path changed.
+
+        Recomputes the matchers that depend on sys.path (the third-party areas
+        and source-packages installed inside them) and remembers the new
+        snapshot.  This is the ownership-plane half of the epoch contract;
+        memory, canonical names and tracer stack state are handled on their
+        own planes by the ViewEpoch callbacks.
+
+        """
+        self.set_matchers_depending_on_syspath()
+        self.last_sys_path = list(sys.path)
+
     def should_trace(self, filename: str, frame: FrameType | None = None) -> TFileDisposition:
         """Decide whether to trace execution in `filename`, with a reason.
 
@@ -351,7 +370,13 @@ class InOrOut:
         Returns a FileDisposition object.
 
         """
-        if sys.path != self.last_sys_path:
+        if self.view_epoch is not None:
+            # The collector's epoch drives matcher recomputation, memory
+            # invalidation and canonical-name invalidation together.
+            self.view_epoch.punch()
+        elif sys.path != self.last_sys_path:
+            # Standalone use (no collector driving us): keep the original
+            # lazy recomputation behavior.
             self.set_matchers_depending_on_syspath()
             self.last_sys_path = list(sys.path)
 
